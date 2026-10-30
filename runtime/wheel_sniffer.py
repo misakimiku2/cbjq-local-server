@@ -84,7 +84,11 @@ KEYS_OF_INTEREST = {0x56: 'V', 0x42: 'B', 0x74: 'F5', 0x75: 'F6', 0x76: 'F7', 0x
                     # SetIgnoreMoveInput 冻结，这几个键正好空出来给相机用。
                     0x57: 'W', 0x41: 'A', 0x53: 'S', 0x44: 'D', 0x51: 'Q', 0x45: 'E',
                     # Z/X：FreeCam 的升降。Q/E 被游戏占为大招，不能用。
-                    0x5A: 'Z', 0x58: 'X'}
+                    0x5A: 'Z', 0x58: 'X',
+                    # ESC：拍照模式下 UI 全隐藏，ESC 直接退出自由相机（Lua v18）。
+                    # Lua 同时把 27 写进 blockList —— 键盘钩子「先记后吞」，
+                    # fp_key.txt 照样收到、游戏菜单不弹；拍照模式外 ESC 照常进菜单。
+                    0x1B: 'ESC'}
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TH32CS_SNAPPROCESS = 0x00000002
@@ -520,31 +524,40 @@ def remove_hooks():
     write_state(False)
 
 
-OVERLAY_TEXT = (
-    "【自由相机】\r\n"
-    "鼠标        转视角\r\n"
-    "W / S       沿视线前后\r\n"
-    "A / D       左右平移\r\n"
-    "E / Q       上升 / 下降\r\n"
-    "滚轮        FOV（长焦↔广角）\r\n"
-    "V           定格（时间冻结）\r\n"
-    "B           退出自由相机"
-)
+# ── 自由相机操作提示 v2（精装键帽版）────────────────────────────
+# 键帽 = 白色描边圆角矩形 + 键帽字母 + 黑色投影；整窗无底板（透明浮在画面上）。
+# 渲染在 overlay_thread() 里用 GDI+ 完成（纯 GDI 做不出抗锯齿圆角和半透明投影）。
+OVL_HEADER = '自 由 相 机'
+# ('cap', 文本) = 键帽；('label', 文本) = 说明；('gap', 像素) = 组间距
+OVL_ROWS = [
+    [('cap', '鼠标'), ('label', '转视角')],
+    [('cap', 'W'), ('cap', 'A'), ('cap', 'S'), ('cap', 'D'), ('label', '移动')],
+    [('cap', 'E'), ('label', '上升'), ('gap', 18), ('cap', 'Q'), ('label', '下降')],
+    [('cap', '滚轮'), ('label', '变焦 FOV')],
+    [('cap', 'V'), ('label', '定格时间')],
+    [('cap', 'B'), ('label', '进入 / 退出'), ('gap', 18), ('cap', 'ESC'), ('label', '退出')],
+]
 
 # 操作提示状态：Lua 进自由相机写 1，退出写 0
 OVLIPC = os.path.join(BASE, 'freecam_on.txt')
 
 
 def overlay_thread():
-    """自由相机的操作提示面板（纯 ctypes 置顶窗口，鼠标穿透，不进任务栏）。
+    """自由相机的操作提示面板 v2（GDI+ 逐像素 alpha 分层窗，鼠标穿透，不进任务栏）。
 
     为什么不是游戏内 UMG：用户不想让它进截图；且 NewObject 的 TextBlock
     拿不到字体，渲染不出来（两次踩坑后放弃）。
 
+    v2（2026-10-30，用户需求「精装」）：
+      * 去掉底部色板 —— 整窗透明，键帽/文字直接浮在画面上
+      * 按键 = 白色描边圆角矩形 + 键帽字母 + 黑色投影（键帽样式）
+      * 全部文字带黑色投影，亮/暗场景都可读
+    实现：GDI+（gdiplusflat）画进 PARGB 位图 → UpdateLayeredWindow。
+    纯 GDI 做不到：圆角无抗锯齿，且 GDI 不写 alpha 字节（半透明投影不可能）。
+
     ⚠ 64 位 ctypes 的坑（每个都实测踩过）：
-      * Python 3.13 的 wintypes 没有 WNDCLASS / HCURSOR / PAINTSTRUCT，要手工定义
+      * Python 3.13 的 wintypes 没有 WNDCLASS / HCURSOR，要手工定义
       * 所有句柄必须显式 argtypes/restypes，否则按 32 位截断直接 OverflowError
-      * FillRect / DrawTextW 在 user32 不在 gdi32
     出错时写 overlay_err.txt，不再静默失败。
     """
     ERRLOG = os.path.join(BASE, 'overlay_err.txt')
@@ -559,6 +572,7 @@ def overlay_thread():
         u = ctypes.windll.user32
         k = ctypes.windll.kernel32
         g = ctypes.windll.gdi32
+        gd = ctypes.WinDLL('gdiplus')
 
         LRESULT = ctypes.c_longlong
         HCURSOR = ctypes.c_void_p
@@ -584,6 +598,44 @@ def overlay_thread():
                 ('lpszClassName', wt.LPCWSTR),
             ]
 
+        class RectF(ctypes.Structure):
+            _fields_ = [('X', ctypes.c_float), ('Y', ctypes.c_float),
+                        ('W', ctypes.c_float), ('H', ctypes.c_float)]
+
+        class GPRECT(ctypes.Structure):
+            _fields_ = [('X', ctypes.c_int), ('Y', ctypes.c_int),
+                        ('W', ctypes.c_int), ('H', ctypes.c_int)]
+
+        class BitmapData(ctypes.Structure):
+            _fields_ = [('Width', ctypes.c_uint), ('Height', ctypes.c_uint),
+                        ('Stride', ctypes.c_int), ('Scan0', ctypes.c_void_p),
+                        ('Reserved', ctypes.c_size_t)]
+
+        class SIZE(ctypes.Structure):
+            _fields_ = [('cx', wt.LONG), ('cy', wt.LONG)]
+
+        class BLENDFUNCTION(ctypes.Structure):
+            _fields_ = [('BlendOp', ctypes.c_ubyte), ('BlendFlags', ctypes.c_ubyte),
+                        ('SourceConstantAlpha', ctypes.c_ubyte),
+                        ('AlphaFormat', ctypes.c_ubyte)]
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [('biSize', wt.DWORD), ('biWidth', wt.LONG), ('biHeight', wt.LONG),
+                        ('biPlanes', wt.WORD), ('biBitCount', wt.WORD),
+                        ('biCompression', wt.DWORD), ('biSizeImage', wt.DWORD),
+                        ('biXPelsPerMeter', wt.LONG), ('biYPelsPerMeter', wt.LONG),
+                        ('biClrUsed', wt.DWORD), ('biClrImportant', wt.DWORD)]
+
+        class BITMAPINFO(ctypes.Structure):
+            _fields_ = [('bmiHeader', BITMAPINFOHEADER),
+                        ('bmiColors', ctypes.c_uint32 * 3)]
+
+        class GdiplusStartupInput(ctypes.Structure):
+            _fields_ = [('GdiplusVersion', ctypes.c_uint32),
+                        ('DebugEventCallback', ctypes.c_void_p),
+                        ('SuppressBackgroundThread', wt.BOOL),
+                        ('SuppressExternalCodecs', wt.BOOL)]
+
         u.CreateWindowExW.restype = wt.HWND
         u.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -596,23 +648,235 @@ def overlay_thread():
         u.DestroyWindow.argtypes = [wt.HWND]
         u.UnregisterClassW.argtypes = [wt.LPCWSTR, wt.HINSTANCE]
         u.IsWindow.argtypes = [wt.HWND]
-        u.IsWindowVisible.argtypes = [wt.HWND]
         u.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
-        u.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
-                                   ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        u.SetTimer.argtypes = [wt.HWND, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
+        u.PostQuitMessage.argtypes = [ctypes.c_int]
         u.BeginPaint.argtypes = [wt.HWND, ctypes.c_void_p]
         u.BeginPaint.restype = wt.HDC
         u.EndPaint.argtypes = [wt.HWND, ctypes.c_void_p]
-        u.GetClientRect.argtypes = [wt.HWND, ctypes.c_void_p]
-        u.SetTimer.argtypes = [wt.HWND, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
-        u.FillRect.argtypes = [wt.HDC, ctypes.c_void_p, wt.HBRUSH]
-        u.DrawTextW.argtypes = [wt.HDC, wt.LPCWSTR, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
-        u.PostQuitMessage.argtypes = [ctypes.c_int]
+        u.GetDC.restype = wt.HDC
+        u.GetDC.argtypes = [wt.HWND]
+        u.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+        u.UpdateLayeredWindow.restype = wt.BOOL
+        u.UpdateLayeredWindow.argtypes = [wt.HWND, wt.HDC, ctypes.c_void_p, ctypes.c_void_p,
+                                          wt.HDC, ctypes.c_void_p, ctypes.c_uint,
+                                          ctypes.c_void_p, ctypes.c_uint]
+        g.CreateCompatibleDC.restype = wt.HDC
+        g.CreateCompatibleDC.argtypes = [wt.HDC]
+        g.DeleteDC.argtypes = [wt.HDC]
+        g.DeleteObject.argtypes = [wt.HANDLE]
+        g.SelectObject.restype = wt.HANDLE
+        g.SelectObject.argtypes = [wt.HDC, wt.HANDLE]
+        g.CreateDIBSection.restype = wt.HBITMAP
+        g.CreateDIBSection.argtypes = [wt.HDC, ctypes.c_void_p, ctypes.c_uint,
+                                       ctypes.POINTER(ctypes.c_void_p), wt.HANDLE,
+                                       ctypes.c_uint]
+
+        # ---- GDI+ flat 绑定：句柄一律 c_void_p、状态码 c_int（64 位截断的教训）----
+        P, I, F = ctypes.c_void_p, ctypes.c_int, ctypes.c_float
+        SZT = ctypes.c_size_t
+        PP = ctypes.POINTER
+
+        def gp(name, restype, *argtypes):
+            # 约定：gp(名字, 返回类型, *参数类型) —— 返回类型恒为 GpStatus(I)
+            fn = getattr(gd, name)
+            fn.restype = restype
+            fn.argtypes = list(argtypes)
+            return fn
+
+        gdi_startup = gp('GdiplusStartup', I, PP(SZT), P, P)
+        bmp_new = gp('GdipCreateBitmapFromScan0', I, I, I, I, I, P, PP(P))
+        #                                                └ w  h  stride fmt scan0 out
+        gfx_of = gp('GdipGetImageGraphicsContext', I, P, PP(P))
+        smooth = gp('GdipSetSmoothingMode', I, P, I)
+        texthint = gp('GdipSetTextRenderingHint', I, P, I)
+        gfx_del = gp('GdipDeleteGraphics', I, P)
+        img_del = gp('GdipDisposeImage', I, P)
+        brush_new = gp('GdipCreateSolidFill', I, ctypes.c_uint32, PP(P))
+        brush_del = gp('GdipDeleteBrush', I, P)
+        pen_new = gp('GdipCreatePen1', I, ctypes.c_uint32, F, I, PP(P))
+        pen_del = gp('GdipDeletePen', I, P)
+        path_new = gp('GdipCreatePath', I, I, PP(P))
+        path_arc = gp('GdipAddPathArc', I, P, F, F, F, F, F, F)
+        path_close = gp('GdipClosePathFigure', I, P)   # ⚠ flat API 叫 ClosePathFigure，
+                                                       # 没有 GdipCloseFigure（托管 API 才是 CloseFigure）
+        path_fill = gp('GdipFillPath', I, P, P, P)
+        path_draw = gp('GdipDrawPath', I, P, P, P)
+        path_del = gp('GdipDeletePath', I, P)
+        fam_new = gp('GdipCreateFontFamilyFromName', I, wt.LPCWSTR, P, PP(P))
+        font_new = gp('GdipCreateFont', I, P, F, I, I, PP(P))
+        font_del = gp('GdipDeleteFont', I, P)
+        fam_del = gp('GdipDeleteFontFamily', I, P)
+        fmt_new = gp('GdipCreateStringFormat', I, I, I, PP(P))
+        fmt_align = gp('GdipSetStringFormatAlign', I, P, I)
+        fmt_line = gp('GdipSetStringFormatLineAlign', I, P, I)
+        fmt_del = gp('GdipDeleteStringFormat', I, P)
+        # ⚠ GdipMeasureString 在这台机器的 gdiplus.dll 上对全有效句柄也会 fail-fast
+        #   （0xC0000409，探针 1-4：裸调用/argtypes/NULL-format/交换参数全试过，
+        #   同参数的 DrawString/GetFontHeight 都正常）—— 测宽弃用它，
+        #   改走 GDI GetTextExtentPoint32W（见下方 mstr），GDI+ 只负责画。
+        str_draw = gp('GdipDrawString', I, P, wt.LPCWSTR, I, P, PP(RectF), P, P)
+        bits_lock = gp('GdipBitmapLockBits', I, P, PP(GPRECT), ctypes.c_uint, I,
+                       PP(BitmapData))
+        bits_unlock = gp('GdipBitmapUnlockBits', I, P, PP(BitmapData))
+
+        token = SZT()
+        gsi = GdiplusStartupInput()
+        gsi.GdiplusVersion = 1
+        if gdi_startup(ctypes.byref(token), ctypes.byref(gsi), None) != 0:
+            fail('GdiplusStartup failed')
+            return
 
         WM_DESTROY, WM_PAINT, WM_TIMER = 0x0002, 0x000F, 0x0113
         WM_ERASEBKGND = 0x0014
-        font = g.CreateFontW(-15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0,
-                             'Microsoft YaHei')
+
+        # ---- 字体（雅黑 UI 优先，失败退雅黑/黑体）----
+        fam = P()
+        for nm in ('Microsoft YaHei UI', 'Microsoft YaHei', 'SimHei'):
+            if fam_new(nm, None, ctypes.byref(fam)) == 0 and fam:
+                break
+        if not fam:
+            fail('no CJK font family')
+            return
+        UNIT_PX = 2
+        fKey = P(); font_new(fam, 15.0, 1, UNIT_PX, ctypes.byref(fKey))    # 键帽字母 Bold
+        fLab = P(); font_new(fam, 14.0, 0, UNIT_PX, ctypes.byref(fLab))    # 说明 Regular
+        fHead = P(); font_new(fam, 14.0, 1, UNIT_PX, ctypes.byref(fHead))  # 标题 Bold
+
+        # NoWrap|NoClip：文字不换行不裁剪；键帽字母水平+垂直居中
+        # ⚠ GdipCreateStringFormat(attributes, language, &format) —— out 参在最后
+        fmtC = P(); fmt_new(0x1000 | 0x4000, 0, ctypes.byref(fmtC))
+        fmt_align(fmtC, 2); fmt_line(fmtC, 2)
+        fmtL = P(); fmt_new(0x1000 | 0x4000, 0, ctypes.byref(fmtL))
+        fmt_line(fmtL, 2)
+
+        # ARGB（0xAARRGGBB）
+        brKey = P(); brush_new(0xFFFFFFFF, ctypes.byref(brKey))   # 键帽字母：白
+        brKeyS = P(); brush_new(0xB4000000, ctypes.byref(brKeyS))  # 字母投影：黑
+        brLab = P(); brush_new(0xF0FFFFFF, ctypes.byref(brLab))   # 说明：白
+        brLabS = P(); brush_new(0x99000000, ctypes.byref(brLabS))  # 说明投影：黑
+        brHead = P(); brush_new(0xF2A8DCFF, ctypes.byref(brHead))  # 标题：淡蓝
+        brHeadS = P(); brush_new(0x99000000, ctypes.byref(brHeadS))
+        brFill = P(); brush_new(0x590E1420, ctypes.byref(brFill))  # 键帽底：深色半透明
+        brShdw = P(); brush_new(0x73000000, ctypes.byref(brShdw))  # 键帽投影：黑
+        penLine = P(); pen_new(0xF2FFFFFF, 2.0, UNIT_PX, ctypes.byref(penLine))  # 白描边
+
+        W0, H0 = 560, 400
+        PARGB = 0x26200A
+        bmp = P()
+        if bmp_new(W0, H0, W0 * 4, PARGB, None, ctypes.byref(bmp)) != 0 or not bmp:
+            fail('CreateBitmapFromScan0 failed')
+            return
+        gfx = P(); gfx_of(bmp, ctypes.byref(gfx))
+        smooth(gfx, 4)      # SmoothingModeAntiAlias
+        texthint(gfx, 4)    # TextRenderingHintAntiAlias（灰度，透明底无彩边）
+
+        # ---- GDI 测宽：GdipMeasureString 不可用（见绑定处注释），
+        #      用 GetTextExtentPoint32W + 同族 GDI 字体量宽；GDI+ 与 GDI 用同一
+        #      字体文件，±1px 误差被键帽左右各 12px padding 吸收 ----
+        _sdc = u.GetDC(None)
+        _mdc = g.CreateCompatibleDC(_sdc)
+        _fKeyG = g.CreateFontW(-15, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0,
+                               'Microsoft YaHei')   # 键帽/标题 Bold
+        _fLabG = g.CreateFontW(-14, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0,
+                               'Microsoft YaHei')   # 说明 Regular
+        _oldG = g.SelectObject(_mdc, _fKeyG)
+        g.GetTextExtentPoint32W.argtypes = [wt.HDC, wt.LPCWSTR, ctypes.c_int,
+                                            ctypes.c_void_p]
+
+        def mstr(text, which):
+            # which: 'k'=键帽粗体 / 'l'=说明常规；返回 (宽, 高)
+            g.SelectObject(_mdc, _fKeyG if which in ('k', 'h') else _fLabG)
+            sz = SIZE()
+            g.GetTextExtentPoint32W(_mdc, text, len(text), ctypes.byref(sz))
+            w = float(sz.cx)
+            if w <= 0.0:      # GDI 字体创建失败的兜底估算
+                w = 15.0 * sum(1.0 if ord(c) > 0x2E7F else 0.55 for c in text)
+            return w, 19.0
+
+        def rr_path(x, y, w, h, r):
+            p = P(); path_new(0, ctypes.byref(p))
+            d = 2.0 * r
+            path_arc(p, x, y, d, d, 180.0, 90.0)
+            path_arc(p, x + w - d, y, d, d, 270.0, 90.0)
+            path_arc(p, x + w - d, y + h - d, d, d, 0.0, 90.0)
+            path_arc(p, x, y + h - d, d, d, 90.0, 90.0)
+            path_close(p)
+            return p
+
+        def draw_text(text, font, fmt, brush, shbrush, x, y, w, h):
+            # 先黑投影（+1,+2）后正文字，键帽字母与说明通用
+            str_draw(gfx, text, len(text), font,
+                     ctypes.byref(RectF(x + 1.0, y + 2.0, w, h)), fmt, shbrush)
+            str_draw(gfx, text, len(text), font,
+                     ctypes.byref(RectF(x, y, w, h)), fmt, brush)
+
+        def draw_cap(x, y, text, tw):
+            w = max(30.0, tw + 24.0)
+            p = rr_path(x, y + 3.0, w, 30.0, 8.0)      # 黑色投影
+            path_fill(gfx, brShdw, p); path_del(p)
+            p = rr_path(x, y, w, 30.0, 8.0)            # 半透明深底 + 白描边
+            path_fill(gfx, brFill, p)
+            path_draw(gfx, penLine, p)
+            path_del(p)
+            draw_text(text, fKey, fmtC, brKey, brKeyS, x, y, w, 30.0)
+            return w
+
+        CAP_H, ROW_GAP, HEAD_GAP = 30.0, 11.0, 10.0
+        MX, MTOP, MBOT = 10.0, 6.0, 8.0
+        x0, y, maxw = MX, MTOP, 0.0
+
+        hw, hh = mstr(OVL_HEADER, 'k')
+        draw_text(OVL_HEADER, fHead, fmtL, brHead, brHeadS, x0, y, hw + 12.0, hh)
+        y += hh + HEAD_GAP
+        if hw > maxw: maxw = hw
+
+        for row in OVL_ROWS:
+            x = x0
+            for item in row:
+                if item[0] == 'cap':
+                    tw, _ = mstr(item[1], 'k')
+                    x += draw_cap(x, y, item[1], tw) + 7.0
+                elif item[0] == 'label':
+                    tw, _ = mstr(item[1], 'l')
+                    draw_text(item[1], fLab, fmtL, brLab, brLabS, x, y, tw + 8.0, CAP_H)
+                    x += tw + 13.0
+                else:
+                    x += float(item[1])
+            if x - 7.0 > maxw: maxw = x - 7.0
+            y += CAP_H + ROW_GAP
+
+        win_w = int(maxw + MX + 8.0)
+        win_h = int(y - ROW_GAP + MBOT)
+
+        # ---- 位图 → 顶层 DIB（PARGB premultiplied，UpdateLayeredWindow 正好吃这个）----
+        hdcScreen = u.GetDC(None)
+        memdc = g.CreateCompatibleDC(hdcScreen)
+        bi = BITMAPINFO()
+        bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bi.bmiHeader.biWidth = W0
+        bi.bmiHeader.biHeight = -H0          # 负高 = top-down
+        bi.bmiHeader.biPlanes = 1
+        bi.bmiHeader.biBitCount = 32
+        bi.bmiHeader.biCompression = 0       # BI_RGB
+        pv = ctypes.c_void_p()
+        hbmp = g.CreateDIBSection(hdcScreen, ctypes.byref(bi), 0, ctypes.byref(pv), None, 0)
+        oldbmp = g.SelectObject(memdc, hbmp)
+        gr = GPRECT(0, 0, W0, H0)
+        bd = BitmapData()
+        if bits_lock(bmp, ctypes.byref(gr), 1, PARGB, ctypes.byref(bd)) == 0 and bd.Scan0:
+            ctypes.memmove(pv, bd.Scan0, bd.Stride * H0)
+            bits_unlock(bmp, ctypes.byref(bd))
+        else:
+            fail('BitmapLockBits failed')
+
+        gfx_del(gfx); img_del(bmp)
+        for f in (fKey, fLab, fHead): font_del(f)
+        fam_del(fam)
+        for fmt in (fmtC, fmtL): fmt_del(fmt)
+        for b in (brKey, brKeyS, brLab, brLabS, brHead, brHeadS, brFill, brShdw):
+            brush_del(b)
+        pen_del(penLine)
 
         def wndproc(hwnd, msg, wp, lp):
             if msg == WM_DESTROY:
@@ -620,21 +884,9 @@ def overlay_thread():
                 return 0
             if msg == WM_ERASEBKGND:
                 return 1
-            if msg == WM_PAINT:
+            if msg == WM_PAINT:              # ULW 内容不走 WM_PAINT，验证掉即可
                 ps = PAINTSTRUCT()
                 hdc = u.BeginPaint(hwnd, ctypes.byref(ps))
-                r = wt.RECT()
-                u.GetClientRect(hwnd, ctypes.byref(r))
-                brush = g.CreateSolidBrush(0x00182030)
-                u.FillRect(hdc, ctypes.byref(r), brush)
-                g.DeleteObject(brush)
-                r.left += 14
-                r.top += 12
-                g.SetBkMode(hdc, 1)
-                g.SetTextColor(hdc, 0x00FFD86A)
-                old = g.SelectObject(hdc, font)
-                u.DrawTextW(hdc, OVERLAY_TEXT, -1, ctypes.byref(r), 0x0000)
-                g.SelectObject(hdc, old)
                 u.EndPaint(hwnd, ctypes.byref(ps))
                 return 0
             return u.DefWindowProcW(hwnd, msg, wp, lp)
@@ -649,13 +901,30 @@ def overlay_thread():
             fail('RegisterClassW failed err=%d' % u.GetLastError())
             return
         hwnd = u.CreateWindowExW(
-            0x00000008 | 0x00000020 | 0x00000080,   # TOPMOST | TRANSPARENT | TOOLWINDOW
+            0x00080000 | 0x00000008 | 0x00000020 | 0x00000080,
+            # LAYERED | TOPMOST | TRANSPARENT | TOOLWINDOW（LAYERED 是 ULW 的前提，v1 漏了）
             'CamZoomFreeCamHelp', 'FreeCam',
             0x80000000,                              # WS_POPUP
-            48, 48, 380, 210, None, None, wc.hInstance, None)
+            48, 48, win_w, win_h, None, None, wc.hInstance, None)
         if not hwnd:
             fail('CreateWindowExW failed err=%d' % u.GetLastError())
             return
+
+        blend = BLENDFUNCTION(0, 0, 255, 1)          # AC_SRC_OVER / 255 / AC_SRC_ALPHA
+        ptSrc = wt.POINT(0, 0)
+        size = SIZE(win_w, win_h)
+        if not u.UpdateLayeredWindow(hwnd, hdcScreen, None, ctypes.byref(size), memdc,
+                                     ctypes.byref(ptSrc), 0, ctypes.byref(blend), 2):
+            fail('UpdateLayeredWindow err=%d' % u.GetLastError())
+        g.SelectObject(memdc, oldbmp)
+        g.DeleteObject(hbmp)
+        g.DeleteDC(memdc)
+        u.ReleaseDC(None, hdcScreen)
+        g.SelectObject(_mdc, _oldG)                 # GDI 测宽资源清理
+        g.DeleteObject(_fKeyG)
+        g.DeleteObject(_fLabG)
+        g.DeleteDC(_mdc)
+        u.ReleaseDC(None, _sdc)
 
         msg = wt.MSG()
         u.SetTimer(None, 991, 300, None)

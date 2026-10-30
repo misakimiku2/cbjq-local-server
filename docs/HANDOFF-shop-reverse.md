@@ -1,7 +1,51 @@
 # 尘白禁区本地服 · 商店商品列表逆向交接
 
-> 状态：**未解决，待逆向**。2026-10-30 记录。
-> 接手前请先读完「已确认事实」和「已排除方案」，能省掉几轮编译。
+> 状态：**已定位，待实机复验**。2026-10-30 更新。
+>
+> ## 结论（客户端字节码实证）
+>
+> `goodsList` 的每个元素**只需要一个 `goodsid` 字段，小写、数字**：
+>
+> ```json
+> {"shopId": 12, "goodsList": [{"goodsid": 1198}, {"goodsid": 1199}]}
+> ```
+>
+> 展示用的 `nGoodsId / tbGDPLN / tbPrice1 / nLimitNum / tbDiscount …` **全部由客户端本地
+> `ShopLogic.tbGoodsConf` 提供**（`LoadGoodsConf` 从本地 `shop/goods.txt` 建立的列名映射：
+> `GoodsId→nGoodsId`、`GDPLN→tbGDPLN`、`Price1→tbPrice1`、`LimitNum→nLimitNum`、
+> `PosIndex→nPosIndex`、`Discount→tbDiscount` …）。
+>
+> 调用链（反汇编自运行时 dump 的字节码）：
+>
+> ```lua
+> -- UMG/Shop/umg_shop.lua:183
+> OnReceiveUpdate(msg): if msg.shopId and msg.goodsList then
+>   local info = ShopLogic.GetShopInfo(msg.shopId)   -- tbShopTabConf[shopId]；nil 就静默 return
+>   self:ShowTypeWidget(info.nWidgetType, {shopId=..., goodsList=..., shopInfo=info})
+>
+> -- Widgets/uw_shop_ordinary.lua:34
+> Init(data): for _, v in ipairs(ShopLogic.Sort(data.goodsList)) do
+>                 TileView:AddItem(Factory:Create(v))
+>
+> -- ShopLogic.Sort:786
+> for _, v in pairs(goodsList) do local info = ShopLogic.GetGoodsInfo(v.goodsid, true) ... end
+> ```
+>
+> 之前几种发法全错的**具体原因**：
+>
+> | 试过的形状 | 为什么失败 |
+> |---|---|
+> | `[]` | 空数组，没东西可画（正常但无商品） |
+> | `[{nGoodsId, tbGDPLN, ...}]` | 字段名是 PascalCase / n 前缀，`Sort` 读 `v.goodsid` 取到 nil → 整条被丢弃 |
+> | `{"1198": 0}` | value 是数字，取 `.goodsid` 得到 nil；数字又被界面当刷新值算 → 数值错乱 |
+> | `{"1198": {...}}` | 同上，元素仍缺 `goodsid` |
+>
+> 购买次数 `buynum` 不走这个响应：`GetBuyNum` → `GetGoodsData` →
+> `json.decode(me:GetStrAttribute(GID, GoodsStart + goodsid))`，是玩家存档属性。
+>
+> **证据链**：pak 内 Lua 是密文解不开（见 `HANDOFF-pak-key.md`），改由运行时
+> `string.dump` 转储 → `tools/luac54.js` 反汇编。原始字节码在 `work/_dump/`。
+
 
 ## 一、目标
 
