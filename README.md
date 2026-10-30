@@ -36,8 +36,9 @@
 
 ## 快速开始
 
-1. 按 [acacia-rs](https://github.com/ahalpha/acacia-rs) 上游说明编译游戏服务器
-   （本仓库含本地修改的 fork 见 …）
+1. 编译游戏服务器：使用含本地修改的 fork
+   [misakimiku2/acacia-rs](https://github.com/misakimiku2/acacia-rs)
+   （上游 [ahalpha/acacia-rs](https://github.com/ahalpha/acacia-rs)，AGPL-3.0，fork 保留全部上游历史可随时同步）
 2. `mock/` 内生成自签名证书并导入系统信任区
 3. hosts 添加 `127.0.0.1 cbjq-serverlist.xoyocdn.com`
 4. `python launcher/launcher.py`（或打包为 exe 后双击）
