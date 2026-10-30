@@ -4,7 +4,8 @@
 >
 > - 列表显示 ✅（`goodsList` 元素只需 `goodsid`）
 > - 购买 ✅（扣费 + 发货 + 已购次数累加，日志实测 4 笔通过）
-> - 剩余：刷新商店（`ShopLogic_UpdateShop`）未实现
+> - 刷新 ✅（私服策略：不扣费、`refreshnum` 保持 0 = 不限次）
+> - 商店线全部完成
 >
 > ## 结论（客户端字节码实证）
 >
@@ -265,6 +266,25 @@ ShopLogic.GID = 1        ShopLogic.GoodsStart = 1000        ShopLogic.MaxBuyNum 
 少这个字段整段就被丢弃（客户端随后把它清成 0）。第一次踩坑就是这里。
 
 `buynum` 只在缺失时初始化 0，购买成功后累加，所以不会每次开商店被清零。
+
+## 刷新商店（`ShopLogic_UpdateShop`）· 已实现
+
+客户端流程（`ShopLogic.UpdateShop`，行 845-887）：
+先查刷新次数 `GetShopRefreshNnm(shopId)` 与上限 `nRefreshLimits`，再查货币够不够
+`tbRefreshFee`，弹确认框 `tip.shopRefreshConfirm`，确认后才
+`me:CallGS("ShopLogic_UpdateShop", {nShopId})`。
+
+刷新次数存在**同一个商店 JSON** 里：`GetShopData(shopId).refreshnum`。
+
+私服处理（口径：物品无限）：
+
+- **不扣费**，`refreshnum` 保持 0 → 界面显示 0/5，刷新不限次
+- 重下商店属性 + **复用 `GetGoodsList` 的通知重发列表**，界面直接重画
+  （`UpdateShop` 没有独立的响应处理器，`PROTO_G_ShopLogic_UpdateShop` 只是请求函数的
+  全局别名，所以借道 `GetGoodsList` 这条路最稳）
+
+⚠ 客户端仍会在本地要求金币 ≥ `tbRefreshFee`（每次 50）才发请求，这一关绕不过去，
+所以账号上要留点金币。
 
 ### 已知缺口：已购次数
 
