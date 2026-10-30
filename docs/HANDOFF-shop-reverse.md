@@ -242,6 +242,26 @@ arg: json!({"shopId": shop_id, "goodsList": []})
 购买后客户端会走 `OnByGoodsUpdate` → `GetLocalGoodsList`，本地没有缓存就重新请求
 `ShopLogic_GetGoodsList`，列表自动刷新。
 
+### 存档属性（2026-10-31 补齐）
+
+客户端「能不能买」读的不是响应，是**玩家存档属性**。探针打出的常量：
+
+```
+ShopLogic.GID = 1        ShopLogic.GoodsStart = 1000        ShopLogic.MaxBuyNum = 99
+```
+
+服务端在 `GetGoodsList` 时一并下发：
+
+| 属性键 | 值 | 用途 |
+|---|---|---|
+| `(1, shopId)` | `{"listversion":1,"tbgoods":[{"goodsid":N,"discountindex":0}]}` | `GetOnLineGoodsInfo` / 能否购买 |
+| `(1, 1000+goodsid)` | `{"buynum":N}` | `GetBuyNum` / 已购次数、限购 |
+
+⚠ **`listversion` 必须存在**：`GetShopData` 里 `if data and data.listversion == nil then return nil`，
+少这个字段整段就被丢弃（客户端随后把它清成 0）。第一次踩坑就是这里。
+
+`buynum` 只在缺失时初始化 0，购买成功后累加，所以不会每次开商店被清零。
+
 ### 已知缺口：已购次数
 
 `GetBuyNum` → `GetGoodsData` → `me:GetStrAttribute(ShopLogic.GID, ShopLogic.GoodsStart + goodsid)`。
