@@ -222,3 +222,33 @@ arg: json!({"shopId": shop_id, "goodsList": []})
 
 所以商店属于**锦上添花**，不影响核心玩法。逆向成本（动 pak + 多轮重启验证）明显高于收益，
 这也是本轮选择搁置的原因。
+
+---
+
+## 购买（`ShopLogic_BuyGoods`）· 已实现，待复验
+
+客户端在发请求前已完成全部本地校验（限购、`GetBuyPrice`、`Cash:GetMoneyCount`），
+然后 `me:CallGS("ShopLogic_BuyGoods", {nGoodsId, nBuyMode, nCount})`。
+
+服务端实现（`acacia-game-server/src/handlers/callgs/shop_logic.rs`）：
+
+1. 按 `nGoodsId` 在 `shop_goods` 全表里找配置
+2. **扣费**：`Price1 = {现金表ID, 单价}`，`cash.txt` 的 `ID` 就是第一个数
+   （1=MONEY / 2=GOLD / 3=SILVER），那行自带 `GDPL`，直接喂 `remove_item_count(gdpl, 单价×数量)`
+3. **发货**：`GDPLN = {genre, detail, particular, level, num}` → `add_item_count(..., num×数量)`
+4. `me.sync()` 下发变更
+5. 回 `{nGoodsId, nCount}`
+
+购买后客户端会走 `OnByGoodsUpdate` → `GetLocalGoodsList`，本地没有缓存就重新请求
+`ShopLogic_GetGoodsList`，列表自动刷新。
+
+### 已知缺口：已购次数
+
+`GetBuyNum` → `GetGoodsData` → `me:GetStrAttribute(ShopLogic.GID, ShopLogic.GoodsStart + goodsid)`。
+服务端**没有写这个属性**，所以：
+
+- 界面「已购」恒为 0，限购不生效（可以无限买）
+- 要补需要 `ShopLogic.GID` 与 `ShopLogic.GoodsStart` 两个常量
+
+取值办法（下一轮探针）：在探针里把 `ShopLogic.GID` / `ShopLogic.GoodsStart` 直接 `print` 出来，
+或在 `tables.tsv` 之外再加一份「数值字段」dump。
