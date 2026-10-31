@@ -45,6 +45,23 @@ SERVER_LOG = os.path.join(SERVER_DIR, 'server.log')
 CERT = os.path.join(MOCK_DIR, 'server.crt')
 KEY = os.path.join(MOCK_DIR, 'server.key')
 
+# ============ 游戏目录（MOD 管理用，可在控制台里改）============
+# 默认值只是兜底；真正的目录从 launcher/game_config.json 读取，读不到就自动探测。
+GAME_CONFIG = os.path.join(ROOT, 'launcher', 'game_config.json')
+GAME_ROOT = r'E:\SeasunCBJQos'
+GAME_EXE = os.path.join(GAME_ROOT, 'SeasunGame.exe')
+PAKS_DIR = os.path.join(GAME_ROOT, r'Game\cbjq\game\Game\Content\Paks')
+PAKS_DISABLED = os.path.join(PAKS_DIR, '_disabled')
+# 游戏自带的官方 pak 前缀；其余 Patch_*.pak 一律视为自制 MOD
+OFFICIAL_PAK_PREFIX = ('Patch_UFS-', 'Patch_NonUFS-', 'Patch_ShaderPatch-')
+
+# ============ 输入嗅探器（拍照模式 MOD 的输入源）============
+# 随本启动器启停：本进程已是管理员（UAC 自提权），拉起嗅探器继承权限，
+# 用户不再需要单独的 UAC 弹窗；启动器退出/关闭全部服务时嗅探器跟着退出。
+PYW = r'C:\Users\MisakiMiku\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe'
+SNIFFER_PY = os.path.join(ROOT, 'runtime', 'wheel_sniffer.py')
+SNIFFER_PID = os.path.join(ROOT, 'runtime', 'sniffer.pid')
+
 WEB_PORT = 8899
 GM_PORT = 1234
 PLAYER_PID = 10001
@@ -66,6 +83,7 @@ _hosts_ok = False
 _hosts_last_fix = ''
 _hosts_events = collections.deque(maxlen=15)
 _resolve_ip = ''
+_stopping = False          # 置 True 后 hosts 守护线程退出，允许清理 hosts 再关进程
 
 
 def is_admin():
@@ -214,6 +232,31 @@ def repair_hosts():
         return False
 
 
+def restore_hosts():
+    """退出启动器时清掉我们写的 hosts 条目。
+
+    不清的话，之后去连正式服客户端仍会被解析到 127.0.0.1（本地服已关，直接连接失败）。
+    """
+    try:
+        try:
+            with open(HOSTS_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.read().splitlines()
+        except Exception:
+            return False
+        kept = [l for l in lines if HOSTS_DOMAIN not in l]
+        if len(kept) == len(lines):
+            return True
+        with open(HOSTS_FILE, 'w', encoding='ascii', errors='ignore', newline='') as f:
+            f.write('\r\n'.join(kept) + '\r\n')
+        subprocess.run('ipconfig /flushdns', shell=True, capture_output=True,
+                       creationflags=CREATE_NO_WINDOW)
+        _hosts_note('已清理 hosts 条目（退出启动器）')
+        return True
+    except Exception as e:
+        _hosts_note('清理 hosts 失败：%s' % e)
+        return False
+
+
 def hosts_guard():
     """常驻守护：加速器（雷神/UU 等）会把自己的 hosts 保护重写、把第三方条目注释掉，
     这里每 2 秒回抢一次，保证客户端始终解析到 127.0.0.1。
@@ -223,7 +266,7 @@ def hosts_guard():
     global _hosts_ok, _resolve_ip
     last_note = 0.0
     tick = 0
-    while True:
+    while not _stopping:
         ok = hosts_effective()
         if not ok:
             ok = repair_hosts()
@@ -256,6 +299,7 @@ def hosts_guard():
 MOCK_LOGS = collections.deque(maxlen=60)
 SERVER_LOGS = collections.deque(maxlen=200)
 _serer_proc = None
+_mock_srv = None
 
 
 def log_mock(msg):
@@ -298,13 +342,31 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
 
 
 def start_mock():
+    global _mock_srv
+    if _mock_srv is not None:
+        return
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT, KEY)
     srv = http.server.ThreadingHTTPServer(('0.0.0.0', 443), MockHandler)
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
+    _mock_srv = srv
     log_mock('地址接管服务已启动（监听 443）')
+
+
+def stop_mock():
+    """关掉 443 接线员。serve_forever 在 daemon 线程里，主线程 shutdown 是安全的。"""
+    global _mock_srv
+    srv, _mock_srv = _mock_srv, None
+    if srv is None:
+        return
+    try:
+        srv.shutdown()
+        srv.server_close()
+    except Exception as e:
+        log_mock('地址接管服务停止异常：%s' % e)
+    log_mock('地址接管服务已停止')
 
 
 # ============ 游戏服务器（acacia）============
@@ -327,6 +389,52 @@ def stop_server():
         _serer_proc.kill()
         SERVER_LOGS.append(f'[{ts()}] 游戏服务器已停止')
     _serer_proc = None
+
+
+# ============ 输入嗅探器启停 ============
+def start_sniffer():
+    """拉起输入嗅探器（wheel_sniffer.py）。
+
+    - 继承本进程的管理员令牌（游戏也是管理员完整性，UIPI 要求嗅探器必须管理员）
+    - --launcher-pid：嗅探器探测到本进程退出后自动自尽，生命周期与本地服一致
+    - 先杀旧实例：嗅探器有单实例互斥量，旧的活着新的会直接退出
+    """
+    stop_sniffer()
+    time.sleep(0.6)
+    try:
+        if not os.path.exists(PYW) or not os.path.exists(SNIFFER_PY):
+            SERVER_LOGS.append(f'[{ts()}] 嗅探器未拉起（缺 pythonw 或 wheel_sniffer.py）')
+            return
+        base_flags = 0x00000008 | 0x00000200        # DETACHED_PROCESS | 新进程组
+        args = [PYW, SNIFFER_PY, '--launcher-pid', str(os.getpid())]
+        kw = dict(cwd=os.path.dirname(SNIFFER_PY), close_fds=True,
+                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL)
+        try:
+            subprocess.Popen(args, creationflags=base_flags | 0x01000000, **kw)  # +脱离job
+        except OSError:
+            subprocess.Popen(args, creationflags=base_flags, **kw)
+        SERVER_LOGS.append(f'[{ts()}] 输入嗅探器已随启动器拉起（管理员）')
+    except Exception as e:
+        SERVER_LOGS.append(f'[{ts()}] 嗅探器拉起失败: {e}')
+
+
+def stop_sniffer():
+    """关停嗅探器：先按 sniffer.pid 精确终止，失败退回 taskkill pythonw。"""
+    try:
+        pid = int(open(SNIFFER_PID, encoding='ascii').read().strip())
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x0001, False, pid)          # PROCESS_TERMINATE
+        if h:
+            k.TerminateProcess(h, 0)
+            k.CloseHandle(h)
+    except Exception:
+        pass
+    try:
+        subprocess.run(['taskkill', '/F', '/IM', 'pythonw.exe'],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW)
+    except Exception:
+        pass
 
 
 def read_server_log():
@@ -366,6 +474,8 @@ def player_online():
 
 # ============ GM 转发 ============
 def gm_call(code):
+    """把命令转发给游戏服务器。服务端会回 {ok, error, ms}，
+    这里把 player-offline / unknown-command 翻成人话，避免"点了没反应还提示成功"。"""
     t0 = time.time()
     try:
         req = urllib.request.Request(
@@ -374,10 +484,203 @@ def gm_call(code):
             headers={'Content-Type': 'application/json'},
             method='POST')
         resp = urllib.request.urlopen(req, timeout=300)
-        _ = resp.read()
-        return {"ok": True, "ms": int((time.time() - t0) * 1000)}
+        raw = resp.read().decode('utf-8', errors='replace')
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {}
+        if body.get('ok'):
+            return {"ok": True, "ms": body.get('ms') or int((time.time() - t0) * 1000)}
+        err = str(body.get('error') or raw or 'unknown')
+        if err.startswith('player-offline'):
+            return {"ok": False, "error": '游戏未在线——请先进入游戏大厅，再回来点这个按钮'}
+        if err.startswith('unknown-command'):
+            return {"ok": False, "error": '服务端不认识这条命令（游戏服务器可能是旧版）'}
+        if err.startswith('run-failed:'):
+            return {"ok": False, "error": err[len('run-failed:'):]}
+        return {"ok": False, "error": err}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ============ 游戏目录配置（可换盘、可换安装位置）============
+def apply_game_root(root):
+    """切换游戏根目录 —— 之后 MOD 列表、启动游戏、pak 目录全部跟着换。"""
+    global GAME_ROOT, GAME_EXE, PAKS_DIR, PAKS_DISABLED
+    GAME_ROOT = root
+    GAME_EXE = os.path.join(root, 'SeasunGame.exe')
+    PAKS_DIR = os.path.join(root, r'Game\cbjq\game\Game\Content\Paks')
+    PAKS_DISABLED = os.path.join(PAKS_DIR, '_disabled')
+
+
+def detect_game_root():
+    """找 SeasunGame.exe：先查常见安装目录，再扫各盘符根下的一层文件夹。"""
+    for base in (r'E:\SeasunCBJQos', r'D:\SeasunCBJQos', r'C:\SeasunCBJQos', r'F:\SeasunCBJQos'):
+        if os.path.isfile(os.path.join(base, 'SeasunGame.exe')):
+            return base
+    for letter in 'CDEFGH':
+        base = letter + ':\\'
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(base, name)
+            try:
+                if os.path.isdir(path) and os.path.isfile(os.path.join(path, 'SeasunGame.exe')):
+                    return path
+            except OSError:
+                continue
+    return ''
+
+
+def save_game_config():
+    try:
+        os.makedirs(os.path.dirname(GAME_CONFIG), exist_ok=True)
+        with open(GAME_CONFIG, 'w', encoding='utf-8') as f:
+            json.dump({'game_root': GAME_ROOT}, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        SERVER_LOGS.append(f'[{ts()}] 保存游戏目录配置失败: {e}')
+        return False
+
+
+def load_game_config():
+    """优先用配置文件；配置缺失或目录已失效时自动探测一次并落盘。"""
+    root = ''
+    try:
+        with open(GAME_CONFIG, 'r', encoding='utf-8') as f:
+            root = (json.load(f) or {}).get('game_root') or ''
+    except Exception:
+        root = ''
+    if root and os.path.isdir(root):
+        apply_game_root(root)
+        return
+    found = detect_game_root()
+    if found:
+        apply_game_root(found)
+        save_game_config()
+
+
+def game_info():
+    return {
+        'root': GAME_ROOT,
+        'exe': GAME_EXE,
+        'exe_found': os.path.isfile(GAME_EXE),
+        'paks_dir': PAKS_DIR,
+        'paks_found': os.path.isdir(PAKS_DIR),
+    }
+
+
+def set_game_root(raw_root):
+    root = str(raw_root or '').strip().strip('"').rstrip('\\/')
+    if not root:
+        return False, '路径为空'
+    if not os.path.isdir(root):
+        return False, '目录不存在：%s' % root
+    if not os.path.isfile(os.path.join(root, 'SeasunGame.exe')):
+        return False, '这个目录下没有 SeasunGame.exe，请选游戏根目录'
+    apply_game_root(root)
+    save_game_config()
+    return True, ''
+
+
+# ============ 服务总控（可停可启，不退出启动器）============
+def services_running():
+    return port_listening(443) or port_listening(5200)
+
+
+def start_all_services():
+    start_mock()
+    start_server()
+    start_sniffer()
+
+
+def stop_all_services():
+    """只停服务，保留本进程。网页控制台必须活着，才能显示“已停止”并支持再次启动。"""
+    stop_server()
+    stop_sniffer()
+    stop_mock()
+
+
+# ============ MOD 管理 ============
+def _is_mod(name):
+    """只认自制 MOD：Patch_ 开头、非官方前缀、.pak 结尾。
+
+    游戏本体的 pak 是 APP_* / App_* / PAK_* / FixConnectionPatch_* 这些，
+    官方热更补丁是 Patch_UFS- / Patch_NonUFS- / Patch_ShaderPatch-，
+    我们自己的 MOD 一律是 Patch_<名字>-Windows_100_P.pak。
+    """
+    low = name.lower()
+    return low.startswith('patch_') and low.endswith('.pak') and not name.startswith(OFFICIAL_PAK_PREFIX)
+
+
+def ensure_mod_dirs():
+    try:
+        os.makedirs(PAKS_DISABLED, exist_ok=True)
+    except Exception as e:
+        SERVER_LOGS.append(f'[{ts()}] 创建 _disabled 目录失败: {e}')
+
+
+def list_mods():
+    items = []
+    for enabled, folder in ((True, PAKS_DIR), (False, PAKS_DISABLED)):
+        if not os.path.isdir(folder):
+            continue
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            if not _is_mod(name):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            items.append({
+                'name': name,
+                'size': st.st_size,
+                'mtime': datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M'),
+                'enabled': enabled,
+            })
+    items.sort(key=lambda x: (not x['enabled'], x['name'].lower()))
+    return items
+
+
+def toggle_mod(raw_name, enable):
+    """启用 / 禁用 = 在 Paks 与 Paks/_disabled 之间移动文件。
+
+    UE4 只加载 `.pak` 扩展名，移出 Paks 目录即视为不加载；
+    用移动而不是改名，是为了不破坏 pak 的加载顺序（按文件名排序）。
+    """
+    name = os.path.basename(str(raw_name or '').strip())
+    if not name or not _is_mod(name) or name in ('.', '..'):
+        return False, '非法文件名'
+    src_dir, dst_dir = (PAKS_DISABLED, PAKS_DIR) if enable else (PAKS_DIR, PAKS_DISABLED)
+    src = os.path.join(src_dir, name)
+    dst = os.path.join(dst_dir, name)
+    if not os.path.isfile(src):
+        return False, '文件不存在（可能已被移动或删除）'
+    if os.path.exists(dst):
+        return False, '目标目录已有同名文件'
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+        os.replace(src, dst)
+    except Exception as e:
+        return False, str(e)
+    return True, ''
+
+
+def launch_game():
+    if not os.path.isfile(GAME_EXE):
+        return False, '找不到游戏启动器：%s' % GAME_EXE
+    try:
+        subprocess.Popen([GAME_EXE], cwd=GAME_ROOT, close_fds=True)
+    except Exception as e:
+        return False, str(e)
+    return True, ''
 
 
 # ============ 网页控制台 ============
@@ -391,7 +694,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
 body { background: #FDF3DC; font-family: "Microsoft YaHei", system-ui, sans-serif; color: #111;
        padding: 22px; min-height: 100vh; }
 h1 { font-size: 24px; font-weight: 900; letter-spacing: 1px; margin-bottom: 4px; }
-.sub { font-size: 13px; color: #666; margin-bottom: 18px; }
+.sub { font-size: 13px; color: #666; margin-bottom: 16px; }
 .card { border: 3px solid #111; background: #fff; box-shadow: 6px 6px 0 #111; border-radius: 14px; padding: 16px 18px; margin-bottom: 18px; }
 .row { display: flex; gap: 14px; flex-wrap: wrap; }
 .status-item { flex: 1; min-width: 200px; border: 3px solid #111; border-radius: 12px; background: #fff; padding: 12px 16px; box-shadow: 4px 4px 0 #111; }
@@ -411,6 +714,9 @@ button.big {
 button.big:hover { filter: brightness(1.05); }
 button.big:active { transform: translate(5px, 5px); box-shadow: 0 0 0 #111; }
 button.big .b-sub { display: block; font-size: 11.5px; font-weight: 500; color: #444; margin-top: 5px; }
+button.tiny { border: 3px solid #111; border-radius: 10px; padding: 8px 14px; font-size: 13px; font-weight: 900;
+              font-family: inherit; cursor: pointer; box-shadow: 3px 3px 0 #111; background: #E9ECEF; }
+button.tiny:active { transform: translate(3px, 3px); box-shadow: 0 0 0 #111; }
 .c-green { background: #A8E6A3 !important; }
 .c-blue  { background: #A5D8FF !important; }
 .c-pink  { background: #FFB3C6 !important; }
@@ -421,8 +727,7 @@ button.big .b-sub { display: block; font-size: 11.5px; font-weight: 500; color: 
 .super-pkg { grid-column: 1 / -1; background: #FFD93D; font-size: 18px; padding: 20px 16px; }
 .logbox { background: #16181D; color: #B8F3C6; border: 3px solid #111; border-radius: 10px; padding: 12px 14px;
           font-family: Consolas, monospace; font-size: 12px; height: 170px; overflow-y: auto; white-space: pre-wrap; box-shadow: 4px 4px 0 #111; }
-.logbox .warnline { color: #FFD93D; }
-.hint { font-size: 12.5px; color: #555; line-height: 1.8; }
+.hint { font-size: 12.5px; color: #555; line-height: 1.9; }
 #toast { position: fixed; right: 24px; bottom: 24px; display: flex; flex-direction: column; gap: 10px; z-index: 99; }
 .toast-item { border: 3px solid #111; border-radius: 10px; padding: 12px 16px; font-weight: 700; font-size: 14px;
               box-shadow: 5px 5px 0 #111; background: #A8E6A3; max-width: 380px; }
@@ -435,67 +740,160 @@ input.cmd { width: 100%; border: 3px solid #111; border-radius: 10px; padding: 1
               border: 3px solid #111; border-radius: 10px; background: #FFA8A8; box-shadow: 4px 4px 0 #111; line-height: 1.7; }
 .net-info { font-size: 12.5px; color: #333; margin-top: 14px; padding: 9px 13px; border-left: 6px solid #111;
             background: #EFEFEF; border-radius: 6px; font-family: Consolas, "Microsoft YaHei", monospace; line-height: 1.6; }
+.svc-bar { display: none; font-size: 13.5px; font-weight: 700; margin-top: 14px; padding: 11px 14px;
+           border: 3px solid #111; border-radius: 10px; background: #FFC078; box-shadow: 4px 4px 0 #111; line-height: 1.7; }
+/* ---- 视图切换 ---- */
+.tabs { display: flex; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+.tab { border: 3px solid #111; border-radius: 12px; padding: 12px 24px; font-size: 15px; font-weight: 900;
+       font-family: inherit; cursor: pointer; background: #fff; box-shadow: 4px 4px 0 #111; }
+.tab.active { background: #FFD93D; }
+.tab:active { transform: translate(4px, 4px); box-shadow: 0 0 0 #111; }
+.view { display: none; }
+.view.active { display: block; }
+/* ---- MOD 管理 ---- */
+.path-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.path-text { flex: 1; min-width: 240px; font-family: Consolas, monospace; font-size: 12px; color: #333;
+             background: #EFEFEF; border-left: 6px solid #111; border-radius: 6px; padding: 10px 12px; word-break: break-all; }
+.mods-list { margin: 14px 0; }
+.mod-row { display: flex; align-items: center; gap: 12px; border: 3px solid #111; border-radius: 12px;
+           padding: 12px 14px; background: #fff; box-shadow: 4px 4px 0 #111; margin-bottom: 10px; }
+.mod-row.off { background: #F2F2F2; border-color: #888; box-shadow: 3px 3px 0 #bbb; }
+.mod-main { flex: 1; min-width: 0; }
+.mod-name { font-size: 14px; font-weight: 900; word-break: break-all; }
+.mod-meta { font-size: 12px; color: #666; margin-top: 4px; font-family: Consolas, monospace; }
+.mod-state { font-size: 12px; font-weight: 900; padding: 5px 12px; border: 2px solid #111; border-radius: 999px; white-space: nowrap; }
+.mod-state.on { background: #A8E6A3; }
+.mod-state.off { background: #E9ECEF; }
+.mod-btn { border: 3px solid #111; border-radius: 10px; padding: 9px 18px; font-weight: 900; font-size: 13px;
+           font-family: inherit; cursor: pointer; background: #FFD93D; box-shadow: 3px 3px 0 #111; white-space: nowrap; }
+.mod-btn.disable { background: #FFA8A8; }
+.mod-btn:active { transform: translate(3px, 3px); box-shadow: 0 0 0 #111; }
+.empty { font-size: 13px; color: #666; padding: 18px; text-align: center; border: 3px dashed #bbb; border-radius: 12px; }
+.actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
+.actions button.big { width: auto; min-width: 200px; }
+.bye { max-width: 660px; margin: 80px auto; border: 3px solid #111; border-radius: 14px; background: #fff;
+       box-shadow: 8px 8px 0 #111; padding: 28px 32px; }
+.bye h1 { font-size: 22px; margin-bottom: 16px; }
+.bye p { font-size: 14px; line-height: 2; color: #333; }
+.bye .tag { display: inline-block; font-size: 12px; font-weight: 900; padding: 4px 12px; border: 2px solid #111;
+            border-radius: 999px; background: #FFA8A8; margin-bottom: 14px; }
 </style>
 </head>
 <body>
 <h1>尘白禁区 · 本地服控制台</h1>
-<div class="sub">双击启动器后本页面会自动打开 · 保持此页面即可随时使用 GM 工具</div>
+<div class="sub">启动器常驻 · 服务可随时启停 · 保持本页面即可管理一切</div>
 
-<div class="card">
-  <div class="row">
-    <div class="status-item"><div class="name">① 地址接管（接线员）</div><div class="val" id="s-mock"><span class="dot off"></span>检查中...</div></div>
-    <div class="status-item"><div class="name">② 游戏服务器（内容屋）</div><div class="val" id="s-server"><span class="dot off"></span>检查中...</div></div>
-    <div class="status-item"><div class="name">③ 游戏连接</div><div class="val" id="s-player"><span class="dot off"></span>检查中...</div></div>
-    <div class="status-item"><div class="name">④ 域名接管（hosts）</div><div class="val" id="s-hosts"><span class="dot off"></span>检查中...</div></div>
+<div class="tabs">
+  <button class="tab active" id="tab-console" onclick="switchView('console')">🎛 控制台</button>
+  <button class="tab" id="tab-mods" onclick="switchView('mods')">🧩 MOD 管理</button>
+</div>
+
+<!-- ==================== 控制台 ==================== -->
+<div class="view active" id="view-console">
+  <div class="card">
+    <div class="row">
+      <div class="status-item"><div class="name">① 地址接管（接线员）</div><div class="val" id="s-mock"><span class="dot off"></span>检查中...</div></div>
+      <div class="status-item"><div class="name">② 游戏服务器（内容屋）</div><div class="val" id="s-server"><span class="dot off"></span>检查中...</div></div>
+      <div class="status-item"><div class="name">③ 游戏连接</div><div class="val" id="s-player"><span class="dot off"></span>检查中...</div></div>
+      <div class="status-item"><div class="name">④ 域名接管（hosts）</div><div class="val" id="s-hosts"><span class="dot off"></span>检查中...</div></div>
+    </div>
+    <div class="svc-bar" id="svc-bar">⚠️ 本地服务已停止 —— 游戏此时连不上。点下方「▶ 启动全部服务」即可恢复，不用重开启动器。</div>
+    <div class="hosts-warn" id="hosts-warn">⚠️ 域名接管失效：加速器（雷神 / UU 等）把 hosts 里的本地服记录注释掉了，客户端会直接连到<b>正式服</b>。点下方「立即修复域名接管」可立刻抢回。</div>
+    <div class="net-info" id="net-info">网络环境检测中...</div>
   </div>
-  <div class="hosts-warn" id="hosts-warn">⚠️ 域名接管失效：加速器（雷神 / UU 等）把 hosts 里的本地服记录注释掉了，客户端会直接连到<b>正式服</b>。点下方「立即修复域名接管」可立刻抢回。</div>
-  <div class="net-info" id="net-info">网络环境检测中...</div>
-</div>
 
-<div class="card">
-  <h2>⚡ 一键 GM 工具（点击即生效）</h2>
-  <div class="playing-tip" id="playing-tip">💡 检测到游戏在线，命令将立即生效；执行后到游戏中切换界面 / 重登即可看到效果。</div>
-  <div class="grid">
-    <button class="big super-pkg" onclick="runSuper()">🎁 超级大礼包（一键全搞定）
-      <span class="b-sub">全解锁 + 全角色 Lv.80 + 全物品 + 全卡池 + 好感度 + 货币 + 经验</span></button>
-    <button class="big c-green" onclick="run('GM.PassGuide()')">🗺️ 解锁全部剧情关卡<span class="b-sub">补写全部关卡通过记录</span></button>
-    <button class="big c-blue" onclick="run('GM.MaxAllGirl()')">⭐ 全角色 / 武器满级 Lv.80<span class="b-sub">一键拉满</span></button>
-    <button class="big c-orange" onclick="run('GM.AddAllItem()')">🎒 全部物品礼包<span class="b-sub">角色/皮肤/武器/后勤/材料</span></button>
-    <button class="big c-purple" onclick="run('GM.Gacha.UnLockAllPool()')">🎰 全部卡池解锁<span class="b-sub">所有抽卡池开放</span></button>
-    <button class="big c-pink" onclick="run('GM.House.AddAllGirlLoveNum(9999)')">💗 全员好感度 +9999<span class="b-sub">宿舍好感一次拉满</span></button>
-    <button class="big c-green" onclick="run('GM.Riki.GMUnLockRiki(1)')">🧭 图鉴全解锁<span class="b-sub">Riki 系统全开</span></button>
-    <button class="big c-orange" onclick="runMoney()">💰 货币大礼包<span class="b-sub">五种货币各 +99999999</span></button>
-    <button class="big c-blue" onclick="run('GM.Add(GM.AddExp, {9999999})')">🚀 账号经验 +9999999<span class="b-sub">分析员快速升级</span></button>
+  <div class="card">
+    <h2>🎮 游戏启动与目录</h2>
+    <div class="path-row">
+      <code class="path-text" id="game-root">读取中...</code>
+      <button class="tiny" onclick="detectGame()">🔍 自动检测</button>
+      <button class="tiny c-green" onclick="launchGame()">🎮 启动游戏</button>
+    </div>
+    <input class="cmd" id="game-root-input" placeholder="换目录时在这里粘贴游戏根目录（需包含 SeasunGame.exe），例如 E:\SeasunCBJQos">
+    <button class="big c-gray" style="width:240px" onclick="saveGameRoot()">💾 保存新目录</button>
+    <div class="hint" style="margin-top:10px">换盘 / 重装游戏后改这里即可 —— MOD 列表和「启动游戏」都会跟着新目录走。</div>
+  </div>
+
+  <div class="card">
+    <h2>⚡ 一键 GM 工具（点击即生效）</h2>
+    <div class="playing-tip" id="playing-tip">💡 检测到游戏在线，命令将立即生效；执行后到游戏中切换界面 / 重登即可看到效果。</div>
+    <div class="grid">
+      <button class="big super-pkg" onclick="runSuper()">🎁 超级大礼包（一键全搞定）
+        <span class="b-sub">全进度通关 + 全领奖 + 全角色 Lv.80 + 全物品 + 全卡池 + 好感度 + 货币 + 经验</span></button>
+      <button class="big c-green" onclick="runComplete()">🏁 一键全进度通关 + 全领奖
+        <span class="b-sub">全部关卡满星通关 + 首通奖励补发 + 章节星级奖励全领</span></button>
+      <button class="big c-pink" onclick="runHouseUnlock()">🏠 宿舍家具 / 好感度全解锁
+        <span class="b-sub">角色房间家具 + 按摩房 / 温泉 / 沙滩 家具 + 全员好感度</span></button>
+      <button class="big c-purple" onclick="runGiveFurniture()">🪑 补发全部宿舍家具
+        <span class="b-sub">324 件 dorm_gift × 99（含嵌入式展示柜）</span></button>
+      <button class="big c-blue" onclick="run('GM.MaxAllGirl()')">⭐ 全角色 / 武器满级 Lv.80<span class="b-sub">一键拉满</span></button>
+      <button class="big c-orange" onclick="run('GM.AddAllItem()')">🎒 全部物品礼包<span class="b-sub">角色/皮肤/武器/后勤/材料/家具</span></button>
+      <button class="big c-purple" onclick="run('GM.Gacha.UnLockAllPool()')">🎰 全部卡池解锁<span class="b-sub">所有抽卡池开放</span></button>
+      <button class="big c-pink" onclick="run('GM.House.AddAllGirlLoveNum(9999)')">💗 全员好感度 +9999<span class="b-sub">宿舍好感一次拉满</span></button>
+      <button class="big c-green" onclick="run('GM.Riki.GMUnLockRiki(1)')">🧭 图鉴全解锁<span class="b-sub">Riki 系统全开</span></button>
+      <button class="big c-orange" onclick="runMoney()">💰 货币大礼包<span class="b-sub">五种货币各 +99999999</span></button>
+      <button class="big c-blue" onclick="run('GM.Add(GM.AddExp, {9999999})')">🚀 账号经验 +9999999<span class="b-sub">分析员快速升级</span></button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>⌨️ 自定义命令</h2>
+    <input class="cmd" id="cmd-input" placeholder='示例：GM.SetAttr({22, 10124, 1}) / GM.House.SkipTaskGuide() / GM.PassAll()'>
+    <button class="big c-gray" style="width:220px" onclick="runCustom()">执行命令</button>
+  </div>
+
+  <div class="card">
+    <h2>📋 服务器日志（实时）</h2>
+    <div class="logbox" id="logbox">加载中...</div>
+  </div>
+
+  <div class="card">
+    <h2>🔧 系统操作</h2>
+    <div class="hint">
+      · 玩游戏期间保持本页面即可（页面关掉也能用 http://127.0.0.1:8899 回来）<br>
+      · 启停按钮是<b>同一个位置切换</b>：服务开着显示「停止全部服务」，停了就变成「启动全部服务」<br>
+      · 「停止全部服务」只停游戏服务，<b>控制台会留着</b>，可随时再启动<br>
+      · 「退出启动器」才会真正关闭本进程（443 / 5200 / 8899 全释放，hosts 条目一并清理）
+    </div>
+    <div class="actions">
+      <button class="big c-green" id="btn-start" onclick="startAll()" style="display:none">▶ 启动全部服务</button>
+      <button class="big c-red" id="btn-stop" onclick="stopAll()">⏹ 停止全部服务</button>
+      <button class="big c-blue" onclick="restartServer()">🔄 重启游戏服务器</button>
+      <button class="big c-orange" onclick="fixHosts()">🔧 立即修复域名接管</button>
+      <button class="big c-gray" onclick="exitLauncher()">🚪 退出启动器</button>
+    </div>
   </div>
 </div>
 
-<div class="card">
-  <h2>⌨️ 自定义命令</h2>
-  <input class="cmd" id="cmd-input" placeholder='示例：GM.AddItem 相关 / GM.SetAttr({22, 10124, 1}) / GM.Add(GM.AddMoney, {1, 999})'>
-  <button class="big c-gray" style="width:220px" onclick="runCustom()">执行命令</button>
-</div>
-
-<div class="card">
-  <h2>📋 服务器日志（实时）</h2>
-  <div class="logbox" id="logbox">加载中...</div>
-</div>
-
-<div class="card">
-  <h2>🔧 系统操作</h2>
-  <div class="hint">
-    · 玩游戏期间：保持本启动器运行即可（页面可关闭，服务不受影响，再次打开 http://127.0.0.1:8899 即可回到本页面）<br>
-    · 若需彻底停止全部服务（接线员 + 游戏服务器）：<br>
-  </div>
-  <div style="margin-top:12px">
-    <button class="big c-red" style="width:260px" onclick="stopAll()">⏹ 关闭全部服务</button>
-    <button class="big c-blue" style="width:260px" onclick="restartServer()">🔄 重启游戏服务器</button>
-    <button class="big c-orange" style="width:260px" onclick="fixHosts()">🔧 立即修复域名接管</button>
+<!-- ==================== MOD 管理 ==================== -->
+<div class="view" id="view-mods">
+  <div class="card">
+    <h2>🧩 MOD 管理器</h2>
+    <div class="path-row">
+      <code class="path-text" id="mods-dir">读取中...</code>
+      <button class="tiny" onclick="openModsFolder()">📂 打开目录</button>
+    </div>
+    <div class="hint">
+      · 只列自制 MOD（游戏自带 <code>Patch_UFS-*</code> / <code>Patch_NonUFS-*</code> / <code>Patch_ShaderPatch-*</code> 已隐藏）<br>
+      · 「禁用」= 把 pak 移到 <code>_disabled</code> 子目录，游戏不再加载它（不动文件名，不影响其余 pak 的加载顺序）<br>
+      · 启用 / 禁用后<b>必须重启游戏</b>才生效；正在运行的游戏进程不会被改动，重启时按新配置加载
+    </div>
+    <div id="mods-list" class="mods-list"><div class="empty">读取中...</div></div>
+    <div class="actions">
+      <button class="big c-blue" onclick="loadMods(true)">🔄 刷新列表</button>
+      <button class="big c-gray" onclick="switchView('console')">🎮 去控制台启动游戏</button>
+    </div>
   </div>
 </div>
 
 <div id="toast"></div>
 
 <script>
+let currentView = 'console';
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 function toast(msg, isErr) {
   const d = document.createElement('div');
   d.className = 'toast-item' + (isErr ? ' err' : '');
@@ -503,16 +901,29 @@ function toast(msg, isErr) {
   document.getElementById('toast').appendChild(d);
   setTimeout(() => d.remove(), 4200);
 }
+function switchView(name) {
+  currentView = name;
+  document.getElementById('view-console').classList.toggle('active', name === 'console');
+  document.getElementById('view-mods').classList.toggle('active', name === 'mods');
+  document.getElementById('tab-console').classList.toggle('active', name === 'console');
+  document.getElementById('tab-mods').classList.toggle('active', name === 'mods');
+  if (name === 'mods') loadMods();
+}
+
 async function refresh() {
   try {
     const r = await fetch('/status');
     const s = await r.json();
-    document.getElementById('s-mock').innerHTML = '<span class="dot ' + (s.mock ? 'on' : 'off') + '"></span>' + (s.mock ? '运行中' : '未运行');
-    document.getElementById('s-server').innerHTML = '<span class="dot ' + (s.server ? 'on' : 'off') + '"></span>' + (s.server ? '运行中' : '未运行');
+    document.getElementById('s-mock').innerHTML = '<span class="dot ' + (s.mock ? 'on' : 'off') + '"></span>' + (s.mock ? '运行中' : '已停止');
+    document.getElementById('s-server').innerHTML = '<span class="dot ' + (s.server ? 'on' : 'off') + '"></span>' + (s.server ? '运行中' : '已停止');
     document.getElementById('s-player').innerHTML = '<span class="dot ' + (s.player ? 'on' : 'warn') + '"></span>' + (s.player ? '已连接（在线）' : '未连接（请进游戏大厅）');
     document.getElementById('s-hosts').innerHTML = '<span class="dot ' + (s.hosts ? 'on' : 'warn') + '"></span>'
       + (s.hosts ? '已接管 → 127.0.0.1' : (s.hosts_admin ? '失效（正被改写）' : '失效（缺管理员）'));
     document.getElementById('hosts-warn').style.display = s.hosts ? 'none' : 'block';
+    const svcDown = !s.mock || !s.server;
+    document.getElementById('svc-bar').style.display = svcDown ? 'block' : 'none';
+    document.getElementById('btn-start').style.display = svcDown ? 'inline-block' : 'none';
+    document.getElementById('btn-stop').style.display = svcDown ? 'none' : 'inline-block';
     const n = s.net || {};
     const ip = s.resolve || '未知';
     document.getElementById('net-info').textContent =
@@ -527,6 +938,7 @@ async function refresh() {
     box.scrollTop = box.scrollHeight;
   } catch (e) {}
 }
+
 async function run(code, silent) {
   const r = await fetch('/gm', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({code}) });
   const j = await r.json();
@@ -534,10 +946,28 @@ async function run(code, silent) {
   else { toast('⚠️ 执行失败：' + (j.error || '未知错误'), true); }
   return j.ok;
 }
+async function runComplete() {
+  toast('🏁 正在补写全进度（约 10~30 秒，请勿关闭页面）...');
+  const ok = await run('GM.CompleteAll()', true);
+  if (ok) toast('🎉 全部关卡已通关满星，章节星级奖励已领取');
+  else toast('⚠️ 执行失败，请确认游戏在线（先进到大厅）', true);
+}
+async function runHouseUnlock() {
+  toast('🏠 正在解锁宿舍家具与好感度（约 5~15 秒）...');
+  const ok = await run('GM.House.UnlockAll()', true);
+  if (ok) toast('🎉 宿舍家具 / 好感度已解锁');
+  else toast('⚠️ 执行失败，请确认游戏在线（先进到大厅）', true);
+}
+async function runGiveFurniture() {
+  toast('🪑 正在发放 324 件宿舍家具...');
+  const ok = await run('GM.House.GiveAllFurniture()', true);
+  if (ok) toast('🎉 全部宿舍家具已到账（各 ×99）');
+  else toast('⚠️ 执行失败，请确认游戏在线（先进到大厅）', true);
+}
 async function runSuper() {
   toast('🎁 超级大礼包开始发放...');
   const list = [
-    ['GM.PassGuide()', '解锁剧情'],
+    ['GM.CompleteAll()', '全进度+全领奖'],
     ['GM.MaxAllGirl()', '满级'],
     ['GM.AddAllItem()', '全物品'],
     ['GM.Gacha.UnLockAllPool()', '全卡池'],
@@ -561,9 +991,35 @@ async function runCustom() {
   if (!v) { toast('请先输入命令', true); return; }
   await run(v);
 }
+
+async function startAll() {
+  toast('▶ 正在启动本地服务...');
+  await fetch('/start_all', { method: 'POST' });
+  setTimeout(refresh, 1500);
+}
+async function stopAll() {
+  if (!confirm('停止全部服务？游戏会断线，但本控制台会保留，可随时再启动。')) return;
+  toast('⏹ 正在停止服务...');
+  await fetch('/stop_all', { method: 'POST' });
+  setTimeout(refresh, 900);
+}
+async function exitLauncher() {
+  if (!confirm('退出启动器？443 / 5200 / 8899 会全部关闭，hosts 条目也会清理，下次需要双击桌面图标重新启动。')) return;
+  await fetch('/exit_launcher', { method: 'POST' });
+  clearInterval(_timer);
+  document.body.innerHTML = `
+    <div class="bye">
+      <div class="tag">已停止</div>
+      <h1>启动器已退出</h1>
+      <p>· 地址接管（443）、游戏服务器（5200）、本控制台（8899）全部已释放</p>
+      <p>· hosts 里的本地服条目已清理，可以正常连接正式服了</p>
+      <p>· 本页面已失效，可直接关闭标签页；下次使用请双击桌面「尘白禁区-本地服」</p>
+    </div>`;
+}
 async function restartServer() {
   await fetch('/restart_server', { method: 'POST' });
   toast('🔄 游戏服务器重启中...');
+  setTimeout(refresh, 2500);
 }
 async function fixHosts() {
   const r = await fetch('/fix_hosts', { method: 'POST' });
@@ -572,12 +1028,104 @@ async function fixHosts() {
   else toast('⚠️ 修复失败：请以管理员身份运行启动器', true);
   refresh();
 }
-async function stopAll() {
-  if (!confirm('确定要关闭全部服务吗？（游戏将断开连接）')) return;
-  await fetch('/stop_app', { method: 'POST' });
-  toast('已关闭全部服务，可关闭本页面');
+
+/* ---------------- MOD 管理 ---------------- */
+async function loadMods(manual) {
+  const box = document.getElementById('mods-list');
+  try {
+    const r = await fetch('/mods/list');
+    const j = await r.json();
+    document.getElementById('mods-dir').textContent = j.dir;
+    if (!j.dir_found) {
+      box.innerHTML = '<div class="empty">找不到 Paks 目录：' + esc(j.dir) + '</div>';
+      return;
+    }
+    if (!j.mods || !j.mods.length) {
+      box.innerHTML = '<div class="empty">没有检测到自制 MOD<br><span style="font-size:12px">（只显示 Paks 目录里非官方的 Patch_*.pak）</span></div>';
+      return;
+    }
+    box.innerHTML = j.mods.map(m => `
+      <div class="mod-row ${m.enabled ? '' : 'off'}">
+        <div class="mod-main">
+          <div class="mod-name">${esc(m.name)}</div>
+          <div class="mod-meta">${(m.size / 1024).toFixed(0)} KB · ${esc(m.mtime)}</div>
+        </div>
+        <div class="mod-state ${m.enabled ? 'on' : 'off'}">${m.enabled ? '启用中' : '已禁用'}</div>
+        <button class="mod-btn ${m.enabled ? 'disable' : ''}" data-name="${esc(m.name)}" data-enable="${!m.enabled}">
+          ${m.enabled ? '禁用' : '启用'}
+        </button>
+      </div>`).join('');
+    box.querySelectorAll('.mod-btn').forEach(btn => {
+      btn.onclick = () => toggleMod(btn.dataset.name, btn.dataset.enable === 'true');
+    });
+    if (manual) toast('🔄 已刷新，共 ' + j.mods.length + ' 个 MOD');
+  } catch (e) {
+    box.innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
+  }
 }
-setInterval(refresh, 2000); refresh();
+async function toggleMod(name, enable) {
+  const r = await fetch('/mods/toggle', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ name, enable })
+  });
+  const j = await r.json();
+  if (j.ok) {
+    toast((enable ? '✅ 已启用：' : '⛔ 已禁用：') + name + '（重启游戏生效）');
+    loadMods();
+  } else {
+    toast('⚠️ 操作失败：' + (j.error || '未知错误'), true);
+  }
+}
+async function openModsFolder() {
+  const r = await fetch('/mods/open_folder', { method: 'POST' });
+  const j = await r.json();
+  if (!j.ok) toast('⚠️ 打开失败：' + (j.error || ''), true);
+}
+async function launchGame() {
+  toast('🎮 正在启动游戏...');
+  const r = await fetch('/game/launch', { method: 'POST' });
+  const j = await r.json();
+  if (j.ok) toast('🎮 游戏启动中，等待进大厅');
+  else toast('⚠️ 启动失败：' + (j.error || ''), true);
+}
+async function loadGameInfo() {
+  try {
+    const r = await fetch('/game/info');
+    const j = await r.json();
+    const box = document.getElementById('game-root');
+    box.textContent = j.root + (j.exe_found ? '' : '   ⚠️ 该目录下没有 SeasunGame.exe');
+    document.getElementById('game-root-input').placeholder =
+      '当前：' + j.root + '　——　粘贴新路径后点「保存新目录」';
+  } catch (e) {}
+}
+async function saveGameRoot() {
+  const v = document.getElementById('game-root-input').value.trim();
+  if (!v) { toast('先在输入框里填写游戏根目录', true); return; }
+  const r = await fetch('/game/config', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ root: v })
+  });
+  const j = await r.json();
+  if (j.ok) {
+    toast('✅ 已切换到：' + j.info.root);
+    document.getElementById('game-root-input').value = '';
+    loadGameInfo();
+    loadMods();
+  } else {
+    toast('⚠️ ' + (j.error || '保存失败'), true);
+  }
+}
+async function detectGame() {
+  toast('🔍 正在扫描盘符寻找 SeasunGame.exe...');
+  const r = await fetch('/game/detect', { method: 'POST' });
+  const j = await r.json();
+  if (j.ok) { toast('✅ 已定位：' + j.root); loadGameInfo(); loadMods(); }
+  else toast('⚠️ ' + (j.error || '没找到'), true);
+}
+
+const _timer = setInterval(refresh, 2000);
+refresh();
+loadMods();
+loadGameInfo();
 </script>
 </body>
 </html>'''
@@ -614,10 +1162,22 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                 "net": net_probe(),
                 "server_log": read_server_log(),
             }))
+        elif self.path == '/game/info':
+            self._send(200, json.dumps(game_info()))
+        elif self.path == '/mods/list':
+            self._send(200, json.dumps({
+                "dir": PAKS_DIR,
+                "disabled_dir": PAKS_DISABLED,
+                "game_exe": GAME_EXE,
+                "game_found": os.path.isfile(GAME_EXE),
+                "dir_found": os.path.isdir(PAKS_DIR),
+                "mods": list_mods(),
+            }))
         else:
             self._send(404, json.dumps({"err": "not found"}))
 
     def do_POST(self):
+        global _hosts_ok, _stopping
         ln = int(self.headers.get('Content-Length', 0))
         raw = self.rfile.read(ln) if ln else b'{}'
         if self.path == '/gm':
@@ -632,22 +1192,99 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
             time.sleep(1)
             start_server()
             self._send(200, json.dumps({"ok": True}))
-        elif self.path == '/stop_app':
-            stop_server()
+        elif self.path == '/start_all':
+            start_all_services()
+            self._send(200, json.dumps({"ok": True}))
+        elif self.path == '/stop_all' or self.path == '/stop_app':
+            # 只停服务，不退出本进程 —— 控制台要留下来显示“已停止”并允许重新启动。
+            # /stop_app 是旧页面的入口，保留别名以免缓存页面点了 404。
+            stop_all_services()
+            self._send(200, json.dumps({"ok": True}))
+        elif self.path == '/exit_launcher':
+            # 先让 hosts 守护线程停下，再清 hosts，最后退出——否则守护线程会把条目又写回去
+            _stopping = True
+            stop_all_services()
+            restore_hosts()
             self._send(200, json.dumps({"ok": True}))
             threading.Timer(0.8, lambda: os._exit(0)).start()
+        elif self.path == '/mods/toggle':
+            try:
+                payload = json.loads(raw.decode('utf-8'))
+            except Exception:
+                payload = {}
+            ok, err = toggle_mod(payload.get('name', ''), bool(payload.get('enable')))
+            self._send(200, json.dumps({"ok": True} if ok else {"ok": False, "error": err}))
+        elif self.path == '/mods/open_folder':
+            try:
+                os.makedirs(PAKS_DIR, exist_ok=True)
+                os.startfile(PAKS_DIR)
+                self._send(200, json.dumps({"ok": True}))
+            except Exception as e:
+                self._send(200, json.dumps({"ok": False, "error": str(e)}))
+        elif self.path == '/game/launch':
+            ok, err = launch_game()
+            self._send(200, json.dumps({"ok": True} if ok else {"ok": False, "error": err}))
+        elif self.path == '/game/config':
+            try:
+                payload = json.loads(raw.decode('utf-8'))
+            except Exception:
+                payload = {}
+            ok, err = set_game_root(payload.get('root', ''))
+            self._send(200, json.dumps({"ok": True, "info": game_info()} if ok else {"ok": False, "error": err}))
+        elif self.path == '/game/detect':
+            found = detect_game_root()
+            if not found:
+                self._send(200, json.dumps({"ok": False, "error": '没找到 SeasunGame.exe，请手动填路径'}))
+            else:
+                ok, err = set_game_root(found)
+                self._send(200, json.dumps({"ok": True, "root": found} if ok else {"ok": False, "error": err}))
         elif self.path == '/fix_hosts':
-            global _hosts_ok
             _hosts_ok = repair_hosts()
             self._send(200, json.dumps({"ok": _hosts_ok, "at": _hosts_last_fix}))
         else:
             self._send(404, json.dumps({"err": "not found"}))
 
 
+# ============ 单实例互斥（重复双击只保留一个启动器）============
+MUTEX_NAME = 'Local\\cbjq-local-launcher'
+_mutex_handle = None
+
+
+def acquire_single_instance():
+    """抢命名互斥量。True = 我是唯一实例；False = 已经有一个在跑。
+
+    比原来的「探测 8899 端口」可靠：端口被别的程序占用时不会误判成"已在运行"，
+    也不会因为 TIME_WAIT 而漏判。
+    """
+    global _mutex_handle
+    try:
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        handle = k32.CreateMutexW(None, False, MUTEX_NAME)
+        err = ctypes.get_last_error()
+        if not handle:
+            return True                      # 创建失败就不要把用户挡在外面
+        if err == 183:                       # ERROR_ALREADY_EXISTS
+            k32.CloseHandle(handle)
+            return False
+        _mutex_handle = handle
+        return True
+    except Exception:
+        return True
+
+
 # ============ 主流程 ============
 def main():
     global _hosts_ok, _resolve_ip
-    # 单实例检测
+
+    # 单实例：已有启动器在跑，就只把控制台打开，不再起第二套服务
+    if not acquire_single_instance():
+        webbrowser.open(f'http://127.0.0.1:{WEB_PORT}')
+        sys.exit(0)
+
+    # 游戏目录（MOD 管理器 / 启动游戏用）；配置缺失或失效时自动探测并落盘
+    load_game_config()
+
+    # 端口兜底检测
     try:
         probe = socket.socket()
         probe.settimeout(0.5)
@@ -686,6 +1323,10 @@ def main():
     start_mock()
     # 2. 游戏服务器
     start_server()
+    # 2.5 输入嗅探器（拍照模式 MOD 输入源；随本启动器启停）
+    start_sniffer()
+    # 2.6 MOD 目录（确保 _disabled 存在，MOD 管理器才有地方放被禁用的 pak）
+    ensure_mod_dirs()
     # 3. Web 控制台
     web = http.server.ThreadingHTTPServer(('127.0.0.1', WEB_PORT), WebHandler)
     threading.Thread(target=web.serve_forever, daemon=True).start()
